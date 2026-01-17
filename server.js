@@ -57,7 +57,6 @@ const initDb = () => {
 initDb();
 
 // --- OPTIMIZATION: Prepared Statements & Transactions ---
-
 const insertManyEvents = db.transaction((roomId, events) => {
   const stmt = db.prepare(`
     INSERT INTO events (id, room_id, iv, data, updated_at) 
@@ -67,14 +66,12 @@ const insertManyEvents = db.transaction((roomId, events) => {
       data=excluded.data,
       updated_at=CURRENT_TIMESTAMP
   `);
-
   for (const event of events) {
     stmt.run(event.id, roomId, event.iv, event.data);
   }
 });
 
 // --- REST API ---
-
 app.post("/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
@@ -138,60 +135,43 @@ app.get("/api/rooms/:roomId/events", (req, res) => {
 });
 
 // --- Real-time Sync & Auto-Cleanup ---
-
-// Map to track pending deletions (RoomID -> Timeout)
 const roomCleanupTimers = new Map();
 
 io.on("connection", (socket) => {
   socket.on("join", (roomId) => {
     socket.join(roomId);
-
-    // If this room was scheduled for deletion (e.g. user refreshed page), cancel it!
     if (roomCleanupTimers.has(roomId)) {
-      console.log(`[Room ${roomId}] User reconnected. Cancelling cleanup.`);
       clearTimeout(roomCleanupTimers.get(roomId));
       roomCleanupTimers.delete(roomId);
     }
   });
 
   socket.on("disconnecting", () => {
-    // Check all rooms this socket was in
     for (const room of socket.rooms) {
       if (room !== socket.id) {
-        // Check how many people are left.
-        // Note: socket.rooms includes the current socket, so we check if size <= 1
         const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
-
         if (roomSize <= 1) {
-          console.log(`[Room ${room}] Empty. Scheduling cleanup in 10s...`);
-
-          // Schedule cleanup for 10 seconds later
           const timer = setTimeout(() => {
-            console.log(
-              `[Room ${room}] Cleanup executing. Deleting event data ONLY.`,
-            );
             try {
-              // Delete Events (Ephemeral data)
               db.prepare("DELETE FROM events WHERE room_id = ?").run(room);
-
-              // NOTE: We do NOT delete the room metadata (rooms table)
-              // This allows the room ID & Password/Salt to persist so users can rejoin
-              // db.prepare("DELETE FROM rooms WHERE id = ?").run(room);
-
               roomCleanupTimers.delete(room);
             } catch (e) {
               console.error(`[Room ${room}] Cleanup failed:`, e);
             }
-          }, 10000); // 10 Second Grace Period
-
+          }, 10000);
           roomCleanupTimers.set(room, timer);
         }
       }
     }
   });
 
-  socket.on("event:save", ({ roomId, event }) => {
-    if (!roomId || !event || !event.id) return;
+  // --- UPDATED LISTENERS WITH ACKNOWLEDGEMENTS ---
+
+  socket.on("event:save", ({ roomId, event }, callback) => {
+    if (!roomId || !event || !event.id) {
+      if (typeof callback === "function") callback({ error: "Invalid data" });
+      return;
+    }
     try {
       db.prepare(
         `
@@ -203,23 +183,34 @@ io.on("connection", (socket) => {
           updated_at=CURRENT_TIMESTAMP
       `,
       ).run(event.id, roomId, event.iv, event.data);
+
       socket.to(roomId).emit("event:sync", event);
+      // ACK SUCCESS
+      if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Save error:", e);
+      // ACK FAILURE
+      if (typeof callback === "function") callback({ error: "Database error" });
     }
   });
 
-  socket.on("event:bulk_save", ({ roomId, events }) => {
-    if (!roomId || !events || !Array.isArray(events)) return;
+  socket.on("event:bulk_save", ({ roomId, events }, callback) => {
+    if (!roomId || !events || !Array.isArray(events)) {
+      if (typeof callback === "function") callback({ error: "Invalid data" });
+      return;
+    }
     try {
       insertManyEvents(roomId, events);
       socket.to(roomId).emit("event:bulk_sync", events);
+      if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Bulk save error:", e);
+      if (typeof callback === "function")
+        callback({ error: "Bulk save failed" });
     }
   });
 
-  socket.on("event:delete", ({ roomId, eventId }) => {
+  socket.on("event:delete", ({ roomId, eventId }, callback) => {
     if (!roomId || !eventId) return;
     try {
       db.prepare("DELETE FROM events WHERE id = ? AND room_id = ?").run(
@@ -227,8 +218,10 @@ io.on("connection", (socket) => {
         roomId,
       );
       socket.to(roomId).emit("event:remove", eventId);
+      if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Delete error:", e);
+      if (typeof callback === "function") callback({ error: "Delete failed" });
     }
   });
 
