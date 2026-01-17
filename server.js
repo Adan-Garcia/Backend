@@ -13,44 +13,40 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "planner.db");
 // --- App Setup ---
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for local dev (restrict in prod)
+    origin: "*",
     methods: ["GET", "POST"],
   },
+  maxHttpBufferSize: 1e8,
 });
 
-// --- Database Setup (better-sqlite3) ---
-// verbose: console.log will log every query to the console (good for debugging)
+// --- Database Setup ---
 const db = new Database(DB_PATH, { verbose: console.log });
-console.log("Connected to SQLite database.");
 
-// Initialize Tables (Synchronous)
 const initDb = () => {
-  // Rooms: Stores the public salt and the private Auth Hash
   db.prepare(
     `
     CREATE TABLE IF NOT EXISTS rooms (
       id TEXT PRIMARY KEY,
       salt TEXT NOT NULL,
       auth_hash TEXT NOT NULL,
-      meta TEXT, -- JSON string for classColors, settings
+      meta TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `,
   ).run();
 
-  // Events: Stores granular encrypted event data
   db.prepare(
     `
     CREATE TABLE IF NOT EXISTS events (
       id TEXT PRIMARY KEY,
       room_id TEXT NOT NULL,
       iv TEXT NOT NULL,
-      data TEXT NOT NULL, -- The encrypted blob
+      data TEXT NOT NULL,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
     )
@@ -60,60 +56,58 @@ const initDb = () => {
 
 initDb();
 
-// --- REST API: Authentication & Initial Load ---
+// --- OPTIMIZATION: Prepared Statements & Transactions ---
 
-/**
- * 1. INIT: Client checks if room exists.
- */
+const insertManyEvents = db.transaction((roomId, events) => {
+  const stmt = db.prepare(`
+    INSERT INTO events (id, room_id, iv, data, updated_at) 
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(id) DO UPDATE SET
+      iv=excluded.iv,
+      data=excluded.data,
+      updated_at=CURRENT_TIMESTAMP
+  `);
+
+  for (const event of events) {
+    stmt.run(event.id, roomId, event.iv, event.data);
+  }
+});
+
+// --- REST API ---
+
 app.post("/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
-
   try {
     const room = db.prepare("SELECT salt FROM rooms WHERE id = ?").get(roomId);
-
-    if (room) {
-      return res.json({ salt: room.salt, isNew: false });
-    } else {
-      const newSalt = crypto.randomBytes(16).toString("hex");
-      return res.json({ salt: newSalt, isNew: true });
-    }
+    if (room) return res.json({ salt: room.salt, isNew: false });
+    const newSalt = crypto.randomBytes(16).toString("hex");
+    return res.json({ salt: newSalt, isNew: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * 2. LOGIN / REGISTER: Client sends Auth Hash.
- */
 app.post("/api/auth/login", (req, res) => {
   const { roomId, authHash, salt } = req.body;
   if (!roomId || !authHash)
     return res.status(400).json({ error: "Missing credentials" });
-
   try {
     const room = db
       .prepare("SELECT auth_hash FROM rooms WHERE id = ?")
       .get(roomId);
-
     if (room) {
-      // VERIFY: Compare client hash with stored hash
       if (room.auth_hash === authHash) {
         const token = Buffer.from(`${roomId}:${authHash}`).toString("base64");
         return res.json({ token, authorized: true });
-      } else {
-        return res.status(401).json({ error: "Incorrect Password" });
       }
+      return res.status(401).json({ error: "Incorrect Password" });
     } else {
-      // CREATE: Register new room
-      if (!salt)
-        return res.status(400).json({ error: "Missing salt for new room" });
-
+      if (!salt) return res.status(400).json({ error: "Missing salt" });
       db.prepare(
         "INSERT INTO rooms (id, salt, auth_hash, meta) VALUES (?, ?, ?, ?)",
       ).run(roomId, salt, authHash, "{}");
-
       const token = Buffer.from(`${roomId}:${authHash}`).toString("base64");
       return res.json({ token, authorized: true, created: true });
     }
@@ -123,47 +117,81 @@ app.post("/api/auth/login", (req, res) => {
   }
 });
 
-/**
- * 3. FETCH DATA: Get all events for a room.
- */
 app.get("/api/rooms/:roomId/events", (req, res) => {
   const { roomId } = req.params;
   const authHeader = req.headers.authorization;
-
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
-
   try {
     const events = db
       .prepare("SELECT id, iv, data FROM events WHERE room_id = ?")
       .all(roomId);
     const room = db.prepare("SELECT meta FROM rooms WHERE id = ?").get(roomId);
-
     let meta = {};
     try {
       meta = JSON.parse(room?.meta || "{}");
     } catch (e) {}
-
-    res.json({
-      events: events,
-      meta: meta,
-    });
+    res.json({ events, meta });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Fetch error" });
   }
 });
 
-// --- Real-time Sync (Socket.io) ---
+// --- Real-time Sync & Auto-Cleanup ---
+
+// Map to track pending deletions (RoomID -> Timeout)
+const roomCleanupTimers = new Map();
 
 io.on("connection", (socket) => {
   socket.on("join", (roomId) => {
     socket.join(roomId);
+
+    // If this room was scheduled for deletion (e.g. user refreshed page), cancel it!
+    if (roomCleanupTimers.has(roomId)) {
+      console.log(`[Room ${roomId}] User reconnected. Cancelling cleanup.`);
+      clearTimeout(roomCleanupTimers.get(roomId));
+      roomCleanupTimers.delete(roomId);
+    }
   });
 
-  // Handle Event Upsert (Add or Update)
+  socket.on("disconnecting", () => {
+    // Check all rooms this socket was in
+    for (const room of socket.rooms) {
+      if (room !== socket.id) {
+        // Check how many people are left.
+        // Note: socket.rooms includes the current socket, so we check if size <= 1
+        const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+
+        if (roomSize <= 1) {
+          console.log(`[Room ${room}] Empty. Scheduling cleanup in 10s...`);
+
+          // Schedule cleanup for 10 seconds later
+          const timer = setTimeout(() => {
+            console.log(
+              `[Room ${room}] Cleanup executing. Deleting event data ONLY.`,
+            );
+            try {
+              // Delete Events (Ephemeral data)
+              db.prepare("DELETE FROM events WHERE room_id = ?").run(room);
+
+              // NOTE: We do NOT delete the room metadata (rooms table)
+              // This allows the room ID & Password/Salt to persist so users can rejoin
+              // db.prepare("DELETE FROM rooms WHERE id = ?").run(room);
+
+              roomCleanupTimers.delete(room);
+            } catch (e) {
+              console.error(`[Room ${room}] Cleanup failed:`, e);
+            }
+          }, 10000); // 10 Second Grace Period
+
+          roomCleanupTimers.set(room, timer);
+        }
+      }
+    }
+  });
+
   socket.on("event:save", ({ roomId, event }) => {
     if (!roomId || !event || !event.id) return;
-
     try {
       db.prepare(
         `
@@ -175,17 +203,24 @@ io.on("connection", (socket) => {
           updated_at=CURRENT_TIMESTAMP
       `,
       ).run(event.id, roomId, event.iv, event.data);
-
       socket.to(roomId).emit("event:sync", event);
     } catch (e) {
       console.error("Save error:", e);
     }
   });
 
-  // Handle Event Delete
+  socket.on("event:bulk_save", ({ roomId, events }) => {
+    if (!roomId || !events || !Array.isArray(events)) return;
+    try {
+      insertManyEvents(roomId, events);
+      socket.to(roomId).emit("event:bulk_sync", events);
+    } catch (e) {
+      console.error("Bulk save error:", e);
+    }
+  });
+
   socket.on("event:delete", ({ roomId, eventId }) => {
     if (!roomId || !eventId) return;
-
     try {
       db.prepare("DELETE FROM events WHERE id = ? AND room_id = ?").run(
         eventId,
@@ -197,7 +232,6 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle Meta Update (Colors)
   socket.on("meta:save", ({ roomId, meta }) => {
     if (!roomId || !meta) return;
     try {
@@ -213,7 +247,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// Start Server
 server.listen(PORT, () => {
   console.log(`Planner Server running on port ${PORT}`);
 });
