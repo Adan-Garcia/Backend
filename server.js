@@ -164,7 +164,7 @@ io.on("connection", (socket) => {
             } catch (e) {
               console.error(`[Room ${room}] Cleanup failed:`, e);
             }
-          }, 10000);
+          }, 600000);
           roomCleanupTimers.set(room, timer);
         }
       }
