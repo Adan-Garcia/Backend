@@ -70,6 +70,12 @@ const insertManyEvents = db.transaction((roomId, events) => {
     stmt.run(event.id, roomId, event.iv, event.data);
   }
 });
+const deleteManyEvents = db.transaction((roomId, ids) => {
+  const stmt = db.prepare("DELETE FROM events WHERE id = ? AND room_id = ?");
+  for (const id of ids) {
+    stmt.run(id, roomId);
+  }
+});
 
 // --- REST API ---
 app.post("/api/auth/init", (req, res) => {
@@ -224,8 +230,26 @@ io.on("connection", (socket) => {
       if (typeof callback === "function") callback({ error: "Delete failed" });
     }
   });
+  socket.on("event:bulk_delete", ({ roomId, eventIds }, callback) => {
+    if (!roomId || !eventIds || !Array.isArray(eventIds)) {
+      if (typeof callback === "function") callback({ error: "Invalid data" });
+      return;
+    }
+    try {
+      deleteManyEvents(roomId, eventIds);
 
-  socket.on("meta:save", ({ roomId, meta }) => {
+      // Notify others to remove these specific IDs
+      socket.to(roomId).emit("event:bulk_remove", eventIds);
+
+      if (typeof callback === "function") callback({ success: true });
+    } catch (e) {
+      console.error("Bulk delete error:", e);
+      if (typeof callback === "function")
+        callback({ error: "Bulk delete failed" });
+    }
+  });
+  // UPDATED: Added callback support
+  socket.on("meta:save", ({ roomId, meta }, callback) => {
     if (!roomId || !meta) return;
     try {
       const jsonMeta = JSON.stringify(meta);
@@ -234,8 +258,11 @@ io.on("connection", (socket) => {
         roomId,
       );
       socket.to(roomId).emit("meta:sync", meta);
+      if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Meta save error:", e);
+      if (typeof callback === "function")
+        callback({ error: "Meta save failed" });
     }
   });
 });
