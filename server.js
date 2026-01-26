@@ -18,7 +18,12 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
+
+// --- SOCKET.IO CONFIGURATION UPDATE ---
 const io = new Server(server, {
+  // CRITICAL FIX: Tell Socket.io to listen on the /backend/socket.io path
+  // instead of the default /socket.io
+  path: "/backend/socket.io", 
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
@@ -79,7 +84,7 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
   }
 });
 
-// --- REST API (Updated with /backend prefix) ---
+// --- REST API (Prefixed with /backend) ---
 app.post("/backend/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
@@ -142,12 +147,12 @@ app.get("/backend/api/rooms/:roomId/events", (req, res) => {
   }
 });
 
-// --- NEW: iCal Proxy (Updated with /backend prefix) ---
+// --- iCal Proxy (Prefixed with /backend) ---
 app.get("/backend/api/proxy/ical", (req, res) => {
   const { url } = req.query;
   const origin = req.get("origin") || req.get("referer");
 
-  // Security Check: Ensure request is from our site
+  // Security Check
   const allowedDomains = ["planner.adangarcia.com", "localhost", "127.0.0.1"];
   let isTrusted = false;
   
@@ -237,11 +242,10 @@ app.get("/backend/api/proxy/ical", (req, res) => {
 // --- Real-time Sync & Auto-Cleanup ---
 const roomCleanupTimers = new Map();
 
-// --- UPDATE: Create a Namespace for '/backend' ---
-// The client connects to "site.com/backend" which Socket.io treats as a namespace.
+// Use the namespace that matches the frontend path assumption
 const nsp = io.of("/backend");
 
-// Helper to broadcast room count (Using Namespace)
+// Helper to broadcast room count
 const broadcastRoomCount = (roomId) => {
   const room = nsp.adapter.rooms.get(roomId);
   const count = room ? room.size : 0;
@@ -262,7 +266,6 @@ nsp.on("connection", (socket) => {
   socket.on("disconnecting", () => {
     for (const room of socket.rooms) {
       if (room !== socket.id) {
-        // Use nsp.adapter here
         const roomSize = nsp.adapter.rooms.get(room)?.size || 0;
         // Broadcast new count (current size - 1 because this socket is leaving)
         nsp.to(room).emit("room:count", Math.max(0, roomSize - 1));
@@ -281,8 +284,6 @@ nsp.on("connection", (socket) => {
       }
     }
   });
-
-  // --- UPDATED LISTENERS WITH ACKNOWLEDGEMENTS ---
 
   socket.on("event:save", ({ roomId, event }, callback) => {
     if (!roomId || !event || !event.id) {
