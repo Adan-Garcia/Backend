@@ -1,8 +1,7 @@
-//
 const express = require("express");
 const http = require("http");
-const https = require("https"); // Added for external proxy requests
-const { URL } = require("url"); // Added for URL parsing
+const https = require("https"); 
+const { URL } = require("url"); 
 const { Server } = require("socket.io");
 const Database = require("better-sqlite3");
 const cors = require("cors");
@@ -148,7 +147,7 @@ app.get("/api/proxy/ical", (req, res) => {
   const { url } = req.query;
   const origin = req.get("origin") || req.get("referer");
 
-  // 1. Security Check: Ensure request is from our site
+  // Security Check: Ensure request is from our site
   const allowedDomains = ["planner.adangarcia.com", "localhost", "127.0.0.1"];
   let isTrusted = false;
   
@@ -158,13 +157,10 @@ app.get("/api/proxy/ical", (req, res) => {
       if (allowedDomains.includes(originHostname)) {
         isTrusted = true;
       }
-    } catch (e) {
-      // Invalid origin URL
-    }
+    } catch (e) {}
   }
 
   if (!isTrusted) {
-    console.log(`[Proxy] Blocked request from unauthorized origin: ${origin}`);
     return res.status(403).json({ error: "Access denied. Invalid origin." });
   }
 
@@ -186,25 +182,20 @@ app.get("/api/proxy/ical", (req, res) => {
 
   client.get(url, (proxyRes) => {
     if (proxyRes.statusCode !== 200) {
-      proxyRes.resume(); // consume response to free memory
+      proxyRes.resume(); 
       return res.status(proxyRes.statusCode).json({ error: "Remote server error" });
     }
 
-    // 2. Content Validation Check: Look for magic string
     let hasValidated = false;
     let buffer = Buffer.alloc(0);
-    const MAX_BUFFER = 4096; // Only check first 4KB
+    const MAX_BUFFER = 4096; 
 
     proxyRes.on("data", (chunk) => {
-      // If we've already validated, just stream chunks directly
       if (hasValidated) {
         return res.write(chunk);
       }
-
-      // Buffer initial chunks to check content
       buffer = Buffer.concat([buffer, chunk]);
 
-      // Check for iCalendar signature
       if (buffer.toString("utf8").includes("BEGIN:VCALENDAR")) {
         hasValidated = true;
         res.writeHead(200, {
@@ -212,9 +203,8 @@ app.get("/api/proxy/ical", (req, res) => {
           "Access-Control-Allow-Origin": "*",
         });
         res.write(buffer);
-        buffer = null; // release memory
+        buffer = null; 
       } else if (buffer.length > MAX_BUFFER) {
-        // If we read 4KB and didn't find the tag, abort
         proxyRes.destroy();
         if (!res.headersSent) {
           res.status(400).json({ error: "Target URL is not a valid iCalendar file." });
@@ -223,7 +213,6 @@ app.get("/api/proxy/ical", (req, res) => {
     });
 
     proxyRes.on("end", () => {
-      // Handle case where file is smaller than one chunk/buffer limit but valid
       if (!hasValidated && buffer) {
         if (buffer.toString("utf8").includes("BEGIN:VCALENDAR")) {
           res.writeHead(200, {
@@ -239,7 +228,6 @@ app.get("/api/proxy/ical", (req, res) => {
     });
 
   }).on("error", (err) => {
-    console.error("Proxy request failed:", err.message);
     if (!res.headersSent) {
       res.status(500).json({ error: "Failed to fetch external calendar." });
     }
@@ -249,6 +237,13 @@ app.get("/api/proxy/ical", (req, res) => {
 // --- Real-time Sync & Auto-Cleanup ---
 const roomCleanupTimers = new Map();
 
+// Helper to broadcast room count
+const broadcastRoomCount = (roomId) => {
+  const room = io.sockets.adapter.rooms.get(roomId);
+  const count = room ? room.size : 0;
+  io.to(roomId).emit("room:count", count);
+};
+
 io.on("connection", (socket) => {
   socket.on("join", (roomId) => {
     socket.join(roomId);
@@ -256,12 +251,17 @@ io.on("connection", (socket) => {
       clearTimeout(roomCleanupTimers.get(roomId));
       roomCleanupTimers.delete(roomId);
     }
+    // Broadcast new count
+    broadcastRoomCount(roomId);
   });
 
   socket.on("disconnecting", () => {
     for (const room of socket.rooms) {
       if (room !== socket.id) {
         const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+        // Broadcast new count (current size - 1 because this socket is leaving)
+        io.to(room).emit("room:count", Math.max(0, roomSize - 1));
+
         if (roomSize <= 1) {
           const timer = setTimeout(() => {
             try {
@@ -270,7 +270,7 @@ io.on("connection", (socket) => {
             } catch (e) {
               console.error(`[Room ${room}] Cleanup failed:`, e);
             }
-          }, 600000);
+          }, 600000); // 10 minutes
           roomCleanupTimers.set(room, timer);
         }
       }
@@ -297,11 +297,9 @@ io.on("connection", (socket) => {
       ).run(event.id, roomId, event.iv, event.data);
 
       socket.to(roomId).emit("event:sync", event);
-      // ACK SUCCESS
       if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Save error:", e);
-      // ACK FAILURE
       if (typeof callback === "function") callback({ error: "Database error" });
     }
   });
@@ -336,6 +334,7 @@ io.on("connection", (socket) => {
       if (typeof callback === "function") callback({ error: "Delete failed" });
     }
   });
+  
   socket.on("event:bulk_delete", ({ roomId, eventIds }, callback) => {
     if (!roomId || !eventIds || !Array.isArray(eventIds)) {
       if (typeof callback === "function") callback({ error: "Invalid data" });
@@ -343,10 +342,7 @@ io.on("connection", (socket) => {
     }
     try {
       deleteManyEvents(roomId, eventIds);
-
-      // Notify others to remove these specific IDs
       socket.to(roomId).emit("event:bulk_remove", eventIds);
-
       if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       console.error("Bulk delete error:", e);
@@ -354,7 +350,7 @@ io.on("connection", (socket) => {
         callback({ error: "Bulk delete failed" });
     }
   });
-  // UPDATED: Added callback support
+
   socket.on("meta:save", ({ roomId, meta }, callback) => {
     if (!roomId || !meta) return;
     try {
