@@ -78,7 +78,7 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
 });
 
 // --- REST API ---
-app.post("/api/auth/init", (req, res) => {
+app.post("/backend/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
   try {
@@ -92,7 +92,7 @@ app.post("/api/auth/init", (req, res) => {
   }
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/backend/api/auth/login", (req, res) => {
   const { roomId, authHash, salt } = req.body;
   if (!roomId || !authHash)
     return res.status(400).json({ error: "Missing credentials" });
@@ -120,7 +120,7 @@ app.post("/api/auth/login", (req, res) => {
   }
 });
 
-app.get("/api/rooms/:roomId/events", (req, res) => {
+app.get("/backend/api/rooms/:roomId/events", (req, res) => {
   const { roomId } = req.params;
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });

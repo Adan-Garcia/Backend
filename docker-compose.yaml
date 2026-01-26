@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  planner-backend:
+    build: .
+    container_name: vite-react-backend
+    ports:
+      - "3001:3001"
+    volumes:
+      # REPLACE THIS with your actual full path
+      - /planner/backend:/app
+      - /app/node_modules
+    environment:
+        - PORT=3001
+        - DB_PATH=/app/planner.db
