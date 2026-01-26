@@ -1,5 +1,8 @@
+//
 const express = require("express");
 const http = require("http");
+const https = require("https"); // Added for external proxy requests
+const { URL } = require("url"); // Added for URL parsing
 const { Server } = require("socket.io");
 const Database = require("better-sqlite3");
 const cors = require("cors");
@@ -78,7 +81,7 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
 });
 
 // --- REST API ---
-app.post("/backend/api/auth/init", (req, res) => {
+app.post("/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
   try {
@@ -92,7 +95,7 @@ app.post("/backend/api/auth/init", (req, res) => {
   }
 });
 
-app.post("/backend/api/auth/login", (req, res) => {
+app.post("/api/auth/login", (req, res) => {
   const { roomId, authHash, salt } = req.body;
   if (!roomId || !authHash)
     return res.status(400).json({ error: "Missing credentials" });
@@ -120,7 +123,7 @@ app.post("/backend/api/auth/login", (req, res) => {
   }
 });
 
-app.get("/backend/api/rooms/:roomId/events", (req, res) => {
+app.get("/api/rooms/:roomId/events", (req, res) => {
   const { roomId } = req.params;
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
@@ -138,6 +141,109 @@ app.get("/backend/api/rooms/:roomId/events", (req, res) => {
     console.error(e);
     res.status(500).json({ error: "Fetch error" });
   }
+});
+
+// --- NEW: iCal Proxy ---
+app.get("/api/proxy/ical", (req, res) => {
+  const { url } = req.query;
+  const origin = req.get("origin") || req.get("referer");
+
+  // 1. Security Check: Ensure request is from our site
+  const allowedDomains = ["planner.adangarcia.com", "localhost", "127.0.0.1"];
+  let isTrusted = false;
+  
+  if (origin) {
+    try {
+      const originHostname = new URL(origin).hostname;
+      if (allowedDomains.includes(originHostname)) {
+        isTrusted = true;
+      }
+    } catch (e) {
+      // Invalid origin URL
+    }
+  }
+
+  if (!isTrusted) {
+    console.log(`[Proxy] Blocked request from unauthorized origin: ${origin}`);
+    return res.status(403).json({ error: "Access denied. Invalid origin." });
+  }
+
+  if (!url) {
+    return res.status(400).json({ error: "Missing url parameter" });
+  }
+
+  let targetUrl;
+  try {
+    targetUrl = new URL(url);
+    if (!["http:", "https:"].includes(targetUrl.protocol)) {
+      throw new Error("Invalid protocol");
+    }
+  } catch (e) {
+    return res.status(400).json({ error: "Invalid URL provided" });
+  }
+
+  const client = targetUrl.protocol === "https:" ? https : http;
+
+  client.get(url, (proxyRes) => {
+    if (proxyRes.statusCode !== 200) {
+      proxyRes.resume(); // consume response to free memory
+      return res.status(proxyRes.statusCode).json({ error: "Remote server error" });
+    }
+
+    // 2. Content Validation Check: Look for magic string
+    let hasValidated = false;
+    let buffer = Buffer.alloc(0);
+    const MAX_BUFFER = 4096; // Only check first 4KB
+
+    proxyRes.on("data", (chunk) => {
+      // If we've already validated, just stream chunks directly
+      if (hasValidated) {
+        return res.write(chunk);
+      }
+
+      // Buffer initial chunks to check content
+      buffer = Buffer.concat([buffer, chunk]);
+
+      // Check for iCalendar signature
+      if (buffer.toString("utf8").includes("BEGIN:VCALENDAR")) {
+        hasValidated = true;
+        res.writeHead(200, {
+          "Content-Type": "text/calendar",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.write(buffer);
+        buffer = null; // release memory
+      } else if (buffer.length > MAX_BUFFER) {
+        // If we read 4KB and didn't find the tag, abort
+        proxyRes.destroy();
+        if (!res.headersSent) {
+          res.status(400).json({ error: "Target URL is not a valid iCalendar file." });
+        }
+      }
+    });
+
+    proxyRes.on("end", () => {
+      // Handle case where file is smaller than one chunk/buffer limit but valid
+      if (!hasValidated && buffer) {
+        if (buffer.toString("utf8").includes("BEGIN:VCALENDAR")) {
+          res.writeHead(200, {
+            "Content-Type": "text/calendar",
+            "Access-Control-Allow-Origin": "*",
+          });
+          res.write(buffer);
+        } else if (!res.headersSent) {
+          res.status(400).json({ error: "Target URL is not a valid iCalendar file." });
+        }
+      }
+      if (!res.writableEnded) res.end();
+    });
+
+  }).on("error", (err) => {
+    console.error("Proxy request failed:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to fetch external calendar." });
+    }
+  });
 });
 
 // --- Real-time Sync & Auto-Cleanup ---
