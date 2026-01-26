@@ -79,8 +79,8 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
   }
 });
 
-// --- REST API ---
-app.post("/api/auth/init", (req, res) => {
+// --- REST API (Updated with /backend prefix) ---
+app.post("/backend/api/auth/init", (req, res) => {
   const { roomId } = req.body;
   if (!roomId) return res.status(400).json({ error: "Missing roomId" });
   try {
@@ -94,7 +94,7 @@ app.post("/api/auth/init", (req, res) => {
   }
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/backend/api/auth/login", (req, res) => {
   const { roomId, authHash, salt } = req.body;
   if (!roomId || !authHash)
     return res.status(400).json({ error: "Missing credentials" });
@@ -122,7 +122,7 @@ app.post("/api/auth/login", (req, res) => {
   }
 });
 
-app.get("/api/rooms/:roomId/events", (req, res) => {
+app.get("/backend/api/rooms/:roomId/events", (req, res) => {
   const { roomId } = req.params;
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
@@ -142,8 +142,8 @@ app.get("/api/rooms/:roomId/events", (req, res) => {
   }
 });
 
-// --- NEW: iCal Proxy ---
-app.get("/api/proxy/ical", (req, res) => {
+// --- NEW: iCal Proxy (Updated with /backend prefix) ---
+app.get("/backend/api/proxy/ical", (req, res) => {
   const { url } = req.query;
   const origin = req.get("origin") || req.get("referer");
 
@@ -237,14 +237,18 @@ app.get("/api/proxy/ical", (req, res) => {
 // --- Real-time Sync & Auto-Cleanup ---
 const roomCleanupTimers = new Map();
 
-// Helper to broadcast room count
+// --- UPDATE: Create a Namespace for '/backend' ---
+// The client connects to "site.com/backend" which Socket.io treats as a namespace.
+const nsp = io.of("/backend");
+
+// Helper to broadcast room count (Using Namespace)
 const broadcastRoomCount = (roomId) => {
-  const room = io.sockets.adapter.rooms.get(roomId);
+  const room = nsp.adapter.rooms.get(roomId);
   const count = room ? room.size : 0;
-  io.to(roomId).emit("room:count", count);
+  nsp.to(roomId).emit("room:count", count);
 };
 
-io.on("connection", (socket) => {
+nsp.on("connection", (socket) => {
   socket.on("join", (roomId) => {
     socket.join(roomId);
     if (roomCleanupTimers.has(roomId)) {
@@ -258,9 +262,10 @@ io.on("connection", (socket) => {
   socket.on("disconnecting", () => {
     for (const room of socket.rooms) {
       if (room !== socket.id) {
-        const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+        // Use nsp.adapter here
+        const roomSize = nsp.adapter.rooms.get(room)?.size || 0;
         // Broadcast new count (current size - 1 because this socket is leaving)
-        io.to(room).emit("room:count", Math.max(0, roomSize - 1));
+        nsp.to(room).emit("room:count", Math.max(0, roomSize - 1));
 
         if (roomSize <= 1) {
           const timer = setTimeout(() => {
