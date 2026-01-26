@@ -1,7 +1,7 @@
 const express = require("express");
 const http = require("http");
-const https = require("https"); 
-const { URL } = require("url"); 
+const https = require("https");
+const { URL } = require("url");
 const { Server } = require("socket.io");
 const Database = require("better-sqlite3");
 const cors = require("cors");
@@ -17,10 +17,9 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "planner.db");
 const app = express();
 
 // SECURITY: Trust the first proxy (Cloudflare Tunnel)
-// This ensures req.ip and req.protocol are correct behind the tunnel
-app.set('trust proxy', 1); 
+app.set('trust proxy', 1);
 
-app.use(cors()); // Standard CORS for REST API
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
@@ -49,9 +48,50 @@ const initDb = () => {
       FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
     )
   `).run();
+
+  // SECURITY: New Session Table
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      room_id TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE
+    )
+  `).run();
 };
 
 initDb();
+
+// --- SECURITY: Rate Limiting (In-Memory) ---
+const loginAttempts = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const MAX_ATTEMPTS = 10;
+
+const rateLimiter = (req, res, next) => {
+  const ip = req.ip;
+  const now = Date.now();
+  const record = loginAttempts.get(ip) || { count: 0, start: now };
+
+  if (now - record.start > RATE_LIMIT_WINDOW) {
+    record.count = 0;
+    record.start = now;
+  }
+
+  if (record.count >= MAX_ATTEMPTS) {
+    return res.status(429).json({ error: "Too many login attempts. Try again later." });
+  }
+
+  record.count++;
+  loginAttempts.set(ip, record);
+  next();
+};
+
+// --- SECURITY: Session Verification ---
+const verifySession = (token) => {
+  if (!token) return null;
+  const session = db.prepare("SELECT room_id FROM sessions WHERE token = ?").get(token);
+  return session ? session.room_id : null;
+};
 
 // --- OPTIMIZATION: Prepared Statements & Transactions ---
 const insertManyEvents = db.transaction((roomId, events) => {
@@ -77,24 +117,22 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
 
 // --- SOCKET.IO CONFIGURATION ---
 const io = new Server(server, {
-  path: "/backend/socket.io", 
+  path: "/backend/socket.io",
   cors: {
-    // SECURITY: Update this list with your actual domain(s)
     origin: [
-        "https://planner.adangarcia.com", 
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000"
+      "https://planner.adangarcia.com",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000"
     ],
     methods: ["GET", "POST"],
     credentials: true
   },
-  maxHttpBufferSize: 1e8,
+  maxHttpBufferSize: 1e6, // Reduced to 1MB for safety
 });
 
 const nsp = io.of("/backend");
 
 // --- SECURITY: Socket Authentication Middleware ---
-// This prevents attackers from connecting directly to the socket to wipe data
 nsp.use((socket, next) => {
   const token = socket.handshake.auth.token;
   const roomId = socket.handshake.query.roomId || socket.handshake.auth.roomId;
@@ -104,23 +142,19 @@ nsp.use((socket, next) => {
   }
 
   try {
-    // Decode token (Format: base64(roomId:authHash))
-    const decoded = Buffer.from(token, 'base64').toString('utf8');
-    const [tokenRoomId, tokenAuthHash] = decoded.split(':');
+    // 1. Verify Session Token against Database
+    const sessionRoomId = verifySession(token);
 
-    // 1. Verify Token belongs to the requested Room
-    if (tokenRoomId !== roomId) {
-       return next(new Error("Authentication error: Room Mismatch"));
+    if (!sessionRoomId) {
+      return next(new Error("Authentication error: Invalid Session"));
     }
 
-    // 2. Verify Credentials against Database
-    const room = db.prepare("SELECT auth_hash FROM rooms WHERE id = ?").get(roomId);
-    
-    if (!room || room.auth_hash !== tokenAuthHash) {
-       return next(new Error("Authentication error: Invalid credentials"));
+    // 2. Verify Token belongs to the requested Room
+    if (sessionRoomId !== roomId) {
+      return next(new Error("Authentication error: Room Mismatch"));
     }
 
-    // 3. Attach verified room ID to socket session for later use
+    // 3. Attach verified room ID
     socket.data.roomId = roomId;
     next();
   } catch (e) {
@@ -145,22 +179,41 @@ app.post("/backend/api/auth/init", (req, res) => {
   }
 });
 
-app.post("/backend/api/auth/login", (req, res) => {
+app.post("/backend/api/auth/login", rateLimiter, (req, res) => {
   const { roomId, authHash, salt } = req.body;
   if (!roomId || !authHash)
     return res.status(400).json({ error: "Missing credentials" });
+
   try {
+    // SECURITY: Hash the incoming authHash (effectively a password)
+    const storageHash = crypto.createHash('sha256').update(authHash).digest('hex');
+
     const room = db.prepare("SELECT auth_hash FROM rooms WHERE id = ?").get(roomId);
+
     if (room) {
-      if (room.auth_hash === authHash) {
-        const token = Buffer.from(`${roomId}:${authHash}`).toString("base64");
+      // SECURITY: Timing-safe comparison
+      const savedBuffer = Buffer.from(room.auth_hash);
+      const attemptBuffer = Buffer.from(storageHash);
+
+      // Protect against length mismatch crashing timingSafeEqual
+      const match = savedBuffer.length === attemptBuffer.length &&
+                    crypto.timingSafeEqual(savedBuffer, attemptBuffer);
+
+      if (match) {
+        // Generate secure random session token
+        const token = crypto.randomUUID();
+        db.prepare("INSERT INTO sessions (token, room_id) VALUES (?, ?)").run(token, roomId);
         return res.json({ token, authorized: true });
       }
       return res.status(401).json({ error: "Incorrect Password" });
     } else {
       if (!salt) return res.status(400).json({ error: "Missing salt" });
-      db.prepare("INSERT INTO rooms (id, salt, auth_hash, meta) VALUES (?, ?, ?, ?)").run(roomId, salt, authHash, "{}");
-      const token = Buffer.from(`${roomId}:${authHash}`).toString("base64");
+      
+      // Store the HASHED version
+      db.prepare("INSERT INTO rooms (id, salt, auth_hash, meta) VALUES (?, ?, ?, ?)").run(roomId, salt, storageHash, "{}");
+      
+      const token = crypto.randomUUID();
+      db.prepare("INSERT INTO sessions (token, room_id) VALUES (?, ?)").run(token, roomId);
       return res.json({ token, authorized: true, created: true });
     }
   } catch (e) {
@@ -172,8 +225,18 @@ app.post("/backend/api/auth/login", (req, res) => {
 app.get("/backend/api/rooms/:roomId/events", (req, res) => {
   const { roomId } = req.params;
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Unauthorized" });
   
+  // SECURITY: Expect "Bearer <uuid>"
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  const sessionRoomId = verifySession(token);
+
+  if (!sessionRoomId || sessionRoomId !== roomId) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   try {
     const events = db.prepare("SELECT id, iv, data FROM events WHERE room_id = ?").all(roomId);
     const room = db.prepare("SELECT meta FROM rooms WHERE id = ?").get(roomId);
@@ -188,22 +251,19 @@ app.get("/backend/api/rooms/:roomId/events", (req, res) => {
 
 // --- SECURE iCal Proxy (SSRF Protected) ---
 
-// Helper: robust check against the RESOLVED IP address
 const isPrivateIP = (ip) => {
   const parts = ip.split('.').map(Number);
   if (parts.length === 4) {
-    // IPv4 Checks
-    if (parts[0] === 0) return true;            // 0.0.0.0/8
-    if (parts[0] === 10) return true;           // 10.0.0.0/8
-    if (parts[0] === 127) return true;          // 127.0.0.0/8
-    if (parts[0] === 169 && parts[1] === 254) return true; // 169.254.0.0/16
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
-    if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16
+    if (parts[0] === 0) return true;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
   } else if (ip.includes(':')) {
-    // IPv6 Checks
     if (ip === '::1') return true;
-    if (ip.toLowerCase().startsWith('fe80::')) return true; // Link-local
-    if (ip.toLowerCase().startsWith('fc') || ip.toLowerCase().startsWith('fd')) return true; // Private
+    if (ip.toLowerCase().startsWith('fe80::')) return true;
+    if (ip.toLowerCase().startsWith('fc') || ip.toLowerCase().startsWith('fd')) return true;
   }
   return false;
 };
@@ -212,7 +272,6 @@ app.get("/backend/api/proxy/ical", (req, res) => {
   const { url: urlParam } = req.query;
   const origin = req.get("origin") || req.get("referer");
 
-  // 1. Origin Check
   const allowedDomains = ["planner.adangarcia.com", "localhost", "127.0.0.1"];
   let isTrusted = false;
   if (origin) {
@@ -221,12 +280,10 @@ app.get("/backend/api/proxy/ical", (req, res) => {
       if (allowedDomains.includes(originHostname)) isTrusted = true;
     } catch (e) {}
   }
-  // If origin is present but not trusted, deny access
   if (!isTrusted && origin) return res.status(403).json({ error: "Access denied. Invalid origin." });
 
   if (!urlParam) return res.status(400).json({ error: "Missing url parameter" });
 
-  // 2. Parse URL
   let targetUrl;
   try {
     targetUrl = new URL(urlParam);
@@ -237,18 +294,14 @@ app.get("/backend/api/proxy/ical", (req, res) => {
     return res.status(400).json({ error: "Invalid URL provided" });
   }
 
-  // 3. DNS Rebinding Protection
-  // Resolve hostname to IP first, then check IP, then connect.
   dns.lookup(targetUrl.hostname, (err, address) => {
     if (err) return res.status(400).json({ error: "Failed to resolve hostname" });
     
-    // Check the REAL IP address
     if (isPrivateIP(address)) {
       console.warn(`[SSRF Block] Blocked attempt to access ${address} (${targetUrl.hostname})`);
       return res.status(403).json({ error: "Access denied. Internal network." });
     }
 
-    // 4. Perform Request
     const client = targetUrl.protocol === "https:" ? https : http;
 
     const proxyRequest = client.get(urlParam, (proxyRes) => {
@@ -267,7 +320,6 @@ app.get("/backend/api/proxy/ical", (req, res) => {
         }
         buffer = Buffer.concat([buffer, chunk]);
 
-        // Validate content is truly a calendar
         if (buffer.toString("utf8").includes("BEGIN:VCALENDAR")) {
           hasValidated = true;
           res.writeHead(200, {
@@ -311,7 +363,6 @@ app.get("/backend/api/proxy/ical", (req, res) => {
 // --- Real-time Sync & Auto-Cleanup ---
 const roomCleanupTimers = new Map();
 
-// Helper to broadcast room count
 const broadcastRoomCount = (roomId) => {
   const room = nsp.adapter.rooms.get(roomId);
   const count = room ? room.size : 0;
@@ -319,11 +370,9 @@ const broadcastRoomCount = (roomId) => {
 };
 
 nsp.on("connection", (socket) => {
-  // We can safely use socket.data.roomId because the middleware guarantees it
   const roomId = socket.data.roomId;
 
   socket.on("join", (requestedRoom) => {
-    // SECURITY: Ensure user only joins the room they authenticated for
     if (requestedRoom !== roomId) {
         socket.emit("error", { message: "Unauthorized: You cannot join this room." });
         return;
@@ -338,15 +387,14 @@ nsp.on("connection", (socket) => {
   });
 
   socket.on("disconnecting", () => {
-    // Cleanup logic
     const roomSize = nsp.adapter.rooms.get(roomId)?.size || 0;
-    // broadcast count - 1
     nsp.to(roomId).emit("room:count", Math.max(0, roomSize - 1));
 
     if (roomSize <= 1) {
       const timer = setTimeout(() => {
         try {
           db.prepare("DELETE FROM events WHERE room_id = ?").run(roomId);
+          db.prepare("DELETE FROM sessions WHERE room_id = ?").run(roomId); // CLEANUP SESSIONS TOO
           roomCleanupTimers.delete(roomId);
         } catch (e) {
           console.error(`[Room ${roomId}] Cleanup failed:`, e);
@@ -356,10 +404,8 @@ nsp.on("connection", (socket) => {
     }
   });
 
-  // --- EVENTS (Protected by Middleware & ID Checks) ---
-  
   socket.on("event:save", ({ roomId: targetRoom, event }, callback) => {
-    if (targetRoom !== roomId) return; // Silent fail if rooms don't match
+    if (targetRoom !== roomId) return;
     if (!event || !event.id) {
       if (typeof callback === "function") callback({ error: "Invalid data" });
       return;
@@ -388,6 +434,12 @@ nsp.on("connection", (socket) => {
       if (typeof callback === "function") callback({ error: "Invalid data" });
       return;
     }
+    // SECURITY: Limit batch size
+    if (events.length > 500) {
+      if (typeof callback === "function") callback({ error: "Batch too large (max 500)" });
+      return;
+    }
+
     try {
       insertManyEvents(roomId, events);
       socket.to(roomId).emit("event:bulk_sync", events);
