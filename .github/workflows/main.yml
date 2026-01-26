@@ -6,7 +6,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: planner-backend
+  IMAGE_NAME: adan-garcia/planner-backend
 
 jobs:
   build-and-push:
@@ -31,4 +31,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/planner-backend:latest
+          tags: ghcr.io/adan-garcia/planner-backend:latest
