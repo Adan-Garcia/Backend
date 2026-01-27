@@ -127,7 +127,7 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
     credentials: true
   },
-  maxHttpBufferSize: 1e6, // Reduced to 1MB for safety
+  maxHttpBufferSize: 1e7, // Reduced to 1MB for safety
 });
 
 const nsp = io.of("/backend");
