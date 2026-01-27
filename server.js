@@ -435,8 +435,8 @@ nsp.on("connection", (socket) => {
       return;
     }
     // SECURITY: Limit batch size
-    if (events.length > 500) {
-      if (typeof callback === "function") callback({ error: "Batch too large (max 500)" });
+    if (events.length > 2000) {
+      if (typeof callback === "function") callback({ error: "Batch too large (max 2000)" });
       return;
     }
 
