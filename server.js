@@ -1,6 +1,7 @@
 const express = require("express");
 const http = require("http");
 const https = require("https");
+const fs = require("fs");
 const { URL } = require("url");
 const { Server } = require("socket.io");
 const Database = require("better-sqlite3");
@@ -13,6 +14,9 @@ const helmet = require("helmet");
 
 // --- Configuration ---
 const PORT = process.env.PORT || 3001;
+const USE_HTTPS = process.env.USE_HTTPS === 'true';
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH;
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "planner.db");
 let APIORIGINS = process.env.ORIGINS ? process.env.ORIGINS.split(',').map(s => s.trim()) : [
       "https://planner.adangarcia.com",
@@ -54,7 +58,24 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Enable pre-flight for all routes
 app.use(express.json({ limit: "10mb" }));
 
-const server = http.createServer(app);
+// --- Server Setup ---
+let server;
+if (USE_HTTPS && SSL_KEY_PATH && SSL_CERT_PATH) {
+  try {
+    const sslOptions = {
+      key: fs.readFileSync(SSL_KEY_PATH),
+      cert: fs.readFileSync(SSL_CERT_PATH)
+    };
+    server = https.createServer(sslOptions, app);
+    console.log('HTTPS server enabled');
+  } catch (error) {
+    console.error('Failed to load SSL certificates, falling back to HTTP:', error.message);
+    server = http.createServer(app);
+  }
+} else {
+  server = http.createServer(app);
+  console.log('HTTP server enabled');
+}
 
 // --- Database Setup ---
 const db = new Database(DB_PATH, process.env.NODE_ENV !== 'production' ? { verbose: console.log } : {});
@@ -671,5 +692,6 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 server.listen(PORT, () => {
-  console.log(`Planner Server running on port ${PORT}`);
+  const protocol = USE_HTTPS ? 'HTTPS' : 'HTTP';
+  console.log(`Planner Server running on ${protocol} port ${PORT}`);
 });

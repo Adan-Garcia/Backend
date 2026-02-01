@@ -8,10 +8,15 @@ services:
     restart: always
     volumes:
       - /planner/backend:/app/data
+      - /etc/ssl/certs/your-cert.pem:/app/ssl/cert.pem:ro
+      - /etc/ssl/private/your-key.pem:/app/ssl/key.pem:ro
     environment:
       - NODE_ENV=production
       - PORT=3001
-      - ORIGINS=["https://planner.adangarcia.com","http://localhost:3000","http://127.0.0.1:3000","https://api.adangarcia.com","https://homework.adangarcia.com"]
+      - USE_HTTPS=true
+      - SSL_CERT_PATH=/app/ssl/cert.pem
+      - SSL_KEY_PATH=/app/ssl/key.pem
+      - ORIGINS=https://planner.adangarcia.com,http://localhost:3000,http://127.0.0.1:3000,https://api.adangarcia.com,https://homework.adangarcia.com
       - DB_PATH=/app/data/planner.db
       - SESSION_TTL_MS=86400000
       - MAX_META_SIZE=2048
