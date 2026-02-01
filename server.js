@@ -32,7 +32,10 @@ const ALLOWED_HOSTNAMES = APIORIGINS.map(o => {
 
 // --- App Setup ---
 const app = express();
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+  crossOriginEmbedderPolicy: false,
+}));
 app.set('trust proxy', 1);
 
 // CORS Configuration
@@ -44,19 +47,38 @@ const corsOptions = {
     if (APIORIGINS.includes(origin)) {
       callback(null, true);
     } else {
+      console.log('CORS rejected origin:', origin);
       callback(new Error('Not allowed by CORS'));
     }
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   exposedHeaders: ['Content-Length', 'Content-Type'],
-  maxAge: 86400 // 24 hours
+  maxAge: 86400, // 24 hours
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 };
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Enable pre-flight for all routes
 app.use(express.json({ limit: "10mb" }));
+
+// Debug middleware to log requests and CORS headers
+app.use((req, res, next) => {
+  const origin = req.get('origin');
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${origin || 'none'}`);
+  
+  // Ensure CORS headers are set even if cors() middleware didn't catch it
+  if (origin && APIORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  }
+  
+  next();
+});
 
 // --- Server Setup ---
 let server;
@@ -315,6 +337,11 @@ nsp.use((socket, next) => {
 });
 
 // --- REST API ---
+
+// Health check endpoint
+app.get("/backend/api/health", (req, res) => {
+  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
 
 app.post("/backend/api/auth/init", (req, res) => {
   const { roomId } = req.body;
