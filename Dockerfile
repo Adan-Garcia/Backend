@@ -7,6 +7,9 @@ RUN apk add --no-cache python3 make g++
 # Set the working directory to /app (standard convention)
 WORKDIR /app
 
+# Create directories for SSL certificates and data
+RUN mkdir -p /app/ssl /app/data
+
 # Copy package.json and package-lock.json
 COPY package*.json ./
 

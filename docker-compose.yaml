@@ -9,8 +9,8 @@ services:
     restart: always
     volumes:
       - /planner/backend:/app/data
-      - /cert.pem:/app/ssl/cert.pem:ro
-      - /key.pem:/app/ssl/key.pem:ro
+      - /planner/cert.pem:/app/ssl/cert.pem:ro
+      - /planner/key.pem:/app/ssl/key.pem:ro
     environment:
       - NODE_ENV=production
       - PORT=3001
