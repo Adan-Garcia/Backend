@@ -1,6 +1,6 @@
 {
   "name": "planner-backend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-Knowledge Local Server for Planner App",
   "main": "server.js",
   "scripts": {
@@ -11,8 +11,8 @@
     "better-sqlite3": "^9.4.3",
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "socket.io": "^4.7.4",
-    "uuid": "^9.0.1"
+    "helmet": "^8.1.0",
+    "socket.io": "^4.7.4"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
