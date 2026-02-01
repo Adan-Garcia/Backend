@@ -1,14 +1,33 @@
 version: '3.8'
 services:
   planner-backend:
-    build: .
+    image: ghcr.io/adan-garcia/planner-backend:latest
     container_name: vite-react-backend
     ports:
       - "3001:3001"
+    restart: always
     volumes:
-      # REPLACE THIS with your actual full path
-      - /planner/backend:/app
-      - /app/node_modules
+      - /planner/backend:/app/data
     environment:
-        - PORT=3001
-        - DB_PATH=/app/planner.db
+      - NODE_ENV=production
+      - PORT=3001
+      - ORIGINS=["https://planner.adangarcia.com","http://localhost:3000","http://127.0.0.1:3000","https://api.adangarcia.com","https://homework.adangarcia.com"]
+      - DB_PATH=/app/data/planner.db
+      - SESSION_TTL_MS=86400000
+      - MAX_META_SIZE=2048
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.docker:/config:ro
+    environment:
+      - DOCKER_API_VERSION=1.44
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=120
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - DOCKER_CONFIG=/config
+    restart: always

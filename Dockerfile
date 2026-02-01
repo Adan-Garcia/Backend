@@ -17,5 +17,4 @@ RUN npm install
 COPY . .
 
 # Start the app using the script defined in package.json
-# Using "npm run start" for production or "npm run dev" for dev
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]
