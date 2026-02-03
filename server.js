@@ -303,6 +303,34 @@ const deleteManyEvents = db.transaction((roomId, ids) => {
   }
 });
 
+// --- SOCKET SECURITY: Connection + Event Rate Limits ---
+const SOCKET_CONN_WINDOW = 60 * 1000;
+const SOCKET_MAX_CONN_PER_WINDOW = parseInt(process.env.SOCKET_MAX_CONN_PER_WINDOW, 10) || 30;
+const SOCKET_MAX_SOCKETS_PER_IP = parseInt(process.env.SOCKET_MAX_SOCKETS_PER_IP, 10) || 20;
+const SOCKET_EVENT_WINDOW = 10 * 1000;
+const SOCKET_MAX_EVENTS_PER_WINDOW = parseInt(process.env.SOCKET_MAX_EVENTS_PER_WINDOW, 10) || 80;
+
+const socketConnectionAttempts = new Map(); // ip -> { count, start }
+const socketConnectionCounts = new Map(); // ip -> count
+
+const getClientIpFromSocket = (socket) => {
+  const headers = socket.handshake?.headers || {};
+  const cfIp = headers["cf-connecting-ip"];
+  const xff = headers["x-forwarded-for"];
+  if (cfIp) return cfIp;
+  if (xff) return xff.split(",")[0].trim();
+  return socket.handshake?.address || socket.conn?.remoteAddress || "unknown";
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of socketConnectionAttempts) {
+    if (now - record.start > SOCKET_CONN_WINDOW * 5) {
+      socketConnectionAttempts.delete(ip);
+    }
+  }
+}, SOCKET_CONN_WINDOW);
+
 // --- SOCKET.IO ---
 const io = new Server(server, {
   path: "/backend/socket.io",
@@ -316,6 +344,30 @@ const io = new Server(server, {
 });
 
 const nsp = io.of("/backend");
+
+nsp.use((socket, next) => {
+  const ip = getClientIpFromSocket(socket);
+  socket.data.clientIp = ip;
+
+  const now = Date.now();
+  const record = socketConnectionAttempts.get(ip) || { count: 0, start: now };
+  if (now - record.start > SOCKET_CONN_WINDOW) {
+    record.count = 0;
+    record.start = now;
+  }
+  if (record.count >= SOCKET_MAX_CONN_PER_WINDOW) {
+    return next(new Error("Rate limit: too many connections"));
+  }
+  record.count++;
+  socketConnectionAttempts.set(ip, record);
+
+  const currentCount = socketConnectionCounts.get(ip) || 0;
+  if (currentCount >= SOCKET_MAX_SOCKETS_PER_IP) {
+    return next(new Error("Connection limit exceeded"));
+  }
+
+  next();
+});
 
 nsp.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -585,6 +637,25 @@ const broadcastRoomCount = (roomId, offset = 0) => {
 };
 
 nsp.on("connection", (socket) => {
+  const clientIp = socket.data.clientIp || "unknown";
+  const currentCount = socketConnectionCounts.get(clientIp) || 0;
+  socketConnectionCounts.set(clientIp, currentCount + 1);
+
+  const eventRate = { count: 0, start: Date.now() };
+  socket.use((packet, next) => {
+    const now = Date.now();
+    if (now - eventRate.start > SOCKET_EVENT_WINDOW) {
+      eventRate.count = 0;
+      eventRate.start = now;
+    }
+    eventRate.count++;
+    if (eventRate.count > SOCKET_MAX_EVENTS_PER_WINDOW) {
+      socket.emit("error", { message: "Rate limit exceeded" });
+      return socket.disconnect(true);
+    }
+    next();
+  });
+
   const roomId = socket.data.roomId;
 
   socket.on("join", (requestedRoom) => {
@@ -599,6 +670,13 @@ nsp.on("connection", (socket) => {
   socket.on("disconnecting", () => {
     // Subtract 1 manually using the offset
     broadcastRoomCount(roomId, -1);
+  });
+
+  socket.on("disconnect", () => {
+    const count = socketConnectionCounts.get(clientIp) || 1;
+    const nextCount = Math.max(0, count - 1);
+    if (nextCount === 0) socketConnectionCounts.delete(clientIp);
+    else socketConnectionCounts.set(clientIp, nextCount);
   });
 
   socket.on("event:save", ({ roomId: targetRoom, event }, callback) => {
@@ -617,7 +695,7 @@ nsp.on("connection", (socket) => {
 
   socket.on("event:bulk_save", ({ roomId: targetRoom, events }, callback) => {
     if (targetRoom !== roomId) return;
-    if (!events || !Array.isArray(events) || events.length > 500) {
+    if (!events || !Array.isArray(events) || events.length > 1000) {
       if (typeof callback === "function") callback({ error: "Invalid data" });
       return;
     }
@@ -655,7 +733,7 @@ nsp.on("connection", (socket) => {
 
   socket.on("event:bulk_delete", ({ roomId: targetRoom, eventIds }, callback) => {
     if (targetRoom !== roomId) return;
-    if (!eventIds || !Array.isArray(eventIds) || eventIds.length > 500) { if (typeof callback === "function") callback({ error: "Invalid data" }); return; }
+    if (!eventIds || !Array.isArray(eventIds) || eventIds.length > 1000) { if (typeof callback === "function") callback({ error: "Invalid data" }); return; }
     for (const eventId of eventIds) {
       if (!validateEventId(eventId)) {
         if (typeof callback === "function") callback({ error: "Invalid eventId" });
@@ -679,7 +757,7 @@ nsp.on("connection", (socket) => {
     try {
       stmts.updateRoomMeta.run(JSON.stringify(meta), roomId);
       stmts.updateRoomLastActive.run(roomId);
-      socket.to(roomId).emit("meta:sync", meta);
+      nsp.to(roomId).emit("meta:sync", meta);
       if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       if (typeof callback === "function") callback({ error: "Meta save failed" });
