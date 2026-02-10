@@ -33,9 +33,33 @@ const ALLOWED_HOSTNAMES = APIORIGINS.map(o => {
 // --- App Setup ---
 const app = express();
 app.use(helmet({
-  crossOriginResourcePolicy: false,
-  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: {
+      "default-src": ["'self'"],
+      "base-uri": ["'self'"],
+      "font-src": ["'self'"],
+      "form-action": ["'self'"],
+      "frame-ancestors": ["'none'"],
+      "img-src": ["'self'", "data:"],
+      "object-src": ["'none'"],
+      "script-src": ["'self'"],
+      "style-src": ["'self'"],
+      "connect-src": ["'self'"]
+    }
+  },
+  crossOriginResourcePolicy: { policy: "same-origin" },
+  crossOriginEmbedderPolicy: { policy: "require-corp" },
+  crossOriginOpenerPolicy: { policy: "same-origin" }
 }));
+// Helmet v8+ does not include permissionsPolicy. Set Permissions-Policy header manually.
+app.use((req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "accelerometer=(), autoplay=(), camera=(), display-capture=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+  );
+  next();
+});
 app.set('trust proxy', 1);
 
 // CORS Configuration
@@ -63,6 +87,16 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Enable pre-flight for all routes
 app.use(express.json({ limit: "10mb" }));
+
+// Cache-Control for sensitive routes
+app.use((req, res, next) => {
+  if (req.path === "/backend/api/health" || req.path === "/backend/api/auth/login") {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  }
+  next();
+});
 
 // Debug middleware to log requests and CORS headers
 app.use((req, res, next) => {
@@ -287,7 +321,9 @@ const validateEventId = (eventId) => {
 };
 
 const validateRoomId = (roomId) => {
-  return roomId && typeof roomId === 'string' && roomId.length > 0 && roomId.length <= MAX_ROOM_ID_LENGTH;
+  if (!roomId || typeof roomId !== 'string') return false;
+  if (roomId.length === 0 || roomId.length > MAX_ROOM_ID_LENGTH) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(roomId);
 };
 
 // --- OPTIMIZATION: Transactions ---
@@ -322,6 +358,15 @@ const getClientIpFromSocket = (socket) => {
   return socket.handshake?.address || socket.conn?.remoteAddress || "unknown";
 };
 
+const getClientIpFromRequest = (req) => {
+  const headers = req.headers || {};
+  const cfIp = headers["cf-connecting-ip"];
+  const xff = headers["x-forwarded-for"];
+  if (cfIp) return cfIp;
+  if (xff) return xff.split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+};
+
 setInterval(() => {
   const now = Date.now();
   for (const [ip, record] of socketConnectionAttempts) {
@@ -340,6 +385,32 @@ const io = new Server(server, {
     credentials: true
   },
   maxHttpBufferSize: 1e7, // 1MB
+  allowRequest: (req, callback) => {
+    const ip = getClientIpFromRequest(req);
+    if (!ip || ip === "unknown") return callback("Unable to determine client IP", false);
+
+    const isHandshake = !(req._query && req._query.sid) && !(req.url && req.url.includes("sid="));
+    if (!isHandshake) return callback(null, true);
+
+    const now = Date.now();
+    const record = socketConnectionAttempts.get(ip) || { count: 0, start: now };
+    if (now - record.start > SOCKET_CONN_WINDOW) {
+      record.count = 0;
+      record.start = now;
+    }
+    if (record.count >= SOCKET_MAX_CONN_PER_WINDOW) {
+      return callback("Rate limit: too many connections", false);
+    }
+    record.count++;
+    socketConnectionAttempts.set(ip, record);
+
+    const currentCount = socketConnectionCounts.get(ip) || 0;
+    if (currentCount >= SOCKET_MAX_SOCKETS_PER_IP) {
+      return callback("Connection limit exceeded", false);
+    }
+
+    return callback(null, true);
+  }
 
 });
 
@@ -347,6 +418,7 @@ const nsp = io.of("/backend");
 
 nsp.use((socket, next) => {
   const ip = getClientIpFromSocket(socket);
+  if (!ip || ip === "unknown") return next(new Error("Unable to determine client IP"));
   socket.data.clientIp = ip;
 
   const now = Date.now();
@@ -625,6 +697,20 @@ app.get("/backend/api/proxy/ical", (req, res) => {
   };
 
   makeRequest(urlParam, MAX_REDIRECTS);
+});
+
+// --- Error Handling (no stack traces) ---
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  const status = err.status || err.statusCode || 500;
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({ error: "Malformed JSON" });
+  }
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ error: "Payload too large" });
+  }
+  console.error("Unhandled error:", err);
+  return res.status(status).json({ error: "Server error" });
 });
 
 // --- REAL-TIME SYNC ---
