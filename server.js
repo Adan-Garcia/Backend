@@ -843,7 +843,8 @@ nsp.on("connection", (socket) => {
     try {
       stmts.updateRoomMeta.run(JSON.stringify(meta), roomId);
       stmts.updateRoomLastActive.run(roomId);
-      nsp.to(roomId).emit("meta:sync", meta);
+      // Broadcast to OTHER clients only — sender already has the latest state
+      socket.to(roomId).emit("meta:sync", meta);
       if (typeof callback === "function") callback({ success: true });
     } catch (e) {
       if (typeof callback === "function") callback({ error: "Meta save failed" });
