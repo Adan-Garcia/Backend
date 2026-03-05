@@ -156,6 +156,7 @@ const initDb = () => {
       id TEXT NOT NULL,
       iv TEXT NOT NULL,
       data TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE,
       PRIMARY KEY (room_id, id)
@@ -189,12 +190,13 @@ const initDb = () => {
           id TEXT NOT NULL,
           iv TEXT NOT NULL,
           data TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 1,
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY(room_id) REFERENCES rooms(id) ON DELETE CASCADE,
           PRIMARY KEY (room_id, id)
         );
-        INSERT OR IGNORE INTO events_new (room_id, id, iv, data, updated_at)
-          SELECT room_id, id, iv, data, updated_at FROM events;
+        INSERT OR IGNORE INTO events_new (room_id, id, iv, data, version, updated_at)
+          SELECT room_id, id, iv, data, 1, updated_at FROM events;
         DROP TABLE events;
         ALTER TABLE events_new RENAME TO events;
         COMMIT;
@@ -203,6 +205,19 @@ const initDb = () => {
     }
   } catch (e) {
     console.error("[DB Migration] Failed to ensure composite PK on events:", e);
+  }
+
+  // Migration: Add version column if it doesn't exist
+  try {
+    const eventColumns = db.prepare("PRAGMA table_info(events)").all();
+    const hasVersion = eventColumns.some(c => c.name === 'version');
+    if (!hasVersion) {
+      console.log("[DB Migration] Adding 'version' column to events table...");
+      db.prepare("ALTER TABLE events ADD COLUMN version INTEGER NOT NULL DEFAULT 1").run();
+      console.log("[DB Migration] 'version' column added successfully.");
+    }
+  } catch (e) {
+    console.error("[DB Migration] Failed to add version column:", e);
   }
 };
 
@@ -226,11 +241,25 @@ const stmts = {
   deleteExpiredRooms: db.prepare("DELETE FROM rooms WHERE last_active < datetime('now', ?)"),
   
   // Events
-  selectRoomEvents: db.prepare("SELECT id, iv, data FROM events WHERE room_id = ?"),
+  selectRoomEvents: db.prepare("SELECT id, iv, data, version FROM events WHERE room_id = ?"),
+  selectEvent: db.prepare("SELECT id, iv, data, version FROM events WHERE room_id = ? AND id = ?"),
   insertOrUpdateEvent: db.prepare(`
-    INSERT INTO events (id, room_id, iv, data, updated_at) 
-    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(room_id, id) DO UPDATE SET iv=excluded.iv, data=excluded.data, updated_at=CURRENT_TIMESTAMP
+    INSERT INTO events (id, room_id, iv, data, version, updated_at) 
+    VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(room_id, id) DO UPDATE SET iv=excluded.iv, data=excluded.data, version=version+1, updated_at=CURRENT_TIMESTAMP
+  `),
+  insertOrUpdateEventForced: db.prepare(`
+    INSERT INTO events (id, room_id, iv, data, version, updated_at) 
+    VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(room_id, id) DO UPDATE SET iv=excluded.iv, data=excluded.data, version=version+1, updated_at=CURRENT_TIMESTAMP
+  `),
+  insertEventWithVersion: db.prepare(`
+    INSERT INTO events (id, room_id, iv, data, version, updated_at) 
+    VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+  `),
+  updateEventWithVersion: db.prepare(`
+    UPDATE events SET iv=?, data=?, version=version+1, updated_at=CURRENT_TIMESTAMP
+    WHERE room_id=? AND id=? AND version=?
   `),
   deleteEvent: db.prepare("DELETE FROM events WHERE id = ? AND room_id = ?"),
 };
@@ -539,6 +568,7 @@ app.get("/backend/api/rooms/:roomId/events", (req, res) => {
 
   try {
     const events = stmts.selectRoomEvents.all(roomId);
+    // Events now include version field from the query
     const room = stmts.selectRoomMeta.get(roomId);
     let meta = {};
     try { meta = JSON.parse(room?.meta || "{}"); } catch (e) {}
@@ -765,16 +795,67 @@ nsp.on("connection", (socket) => {
     else socketConnectionCounts.set(clientIp, nextCount);
   });
 
-  socket.on("event:save", ({ roomId: targetRoom, event }, callback) => {
+  socket.on("event:save", ({ roomId: targetRoom, event, version, force }, callback) => {
     if (targetRoom !== roomId) return;
     const validation = validateEventInput(event);
     if (!validation.valid) { if (typeof callback === "function") callback({ error: validation.error }); return; }
     try {
-      stmts.insertOrUpdateEvent.run(event.id, roomId, event.iv, event.data);
-      stmts.updateRoomLastActive.run(roomId);
-      socket.to(roomId).emit("event:sync", event);
-      if (typeof callback === "function") callback({ success: true });
+      // Check if event already exists in DB
+      const existing = stmts.selectEvent.get(roomId, event.id);
+
+      if (!existing) {
+        // New event — insert directly
+        stmts.insertEventWithVersion.run(event.id, roomId, event.iv, event.data);
+        stmts.updateRoomLastActive.run(roomId);
+        const inserted = stmts.selectEvent.get(roomId, event.id);
+        const newVersion = inserted ? inserted.version : 1;
+        socket.to(roomId).emit("event:sync", { ...event, version: newVersion });
+        if (typeof callback === "function") callback({ success: true, version: newVersion });
+      } else if (force) {
+        // Force save (last-write-wins fallback) — skip version check
+        stmts.insertOrUpdateEventForced.run(event.id, roomId, event.iv, event.data);
+        stmts.updateRoomLastActive.run(roomId);
+        const updated = stmts.selectEvent.get(roomId, event.id);
+        const newVersion = updated ? updated.version : existing.version + 1;
+        socket.to(roomId).emit("event:sync", { ...event, version: newVersion });
+        if (typeof callback === "function") callback({ success: true, version: newVersion });
+      } else if (typeof version === 'number' && version !== existing.version) {
+        // Version mismatch — conflict detected!
+        if (typeof callback === "function") {
+          callback({
+            conflict: true,
+            serverVersion: existing.version,
+            serverEvent: { id: existing.id, iv: existing.iv, data: existing.data },
+          });
+        }
+      } else {
+        // Version matches or no version sent — normal OCC update
+        if (typeof version === 'number') {
+          const result = stmts.updateEventWithVersion.run(event.iv, event.data, roomId, event.id, version);
+          if (result.changes === 0) {
+            // Race condition: version changed between check and update
+            const current = stmts.selectEvent.get(roomId, event.id);
+            if (typeof callback === "function") {
+              callback({
+                conflict: true,
+                serverVersion: current ? current.version : existing.version,
+                serverEvent: current ? { id: current.id, iv: current.iv, data: current.data } : { id: existing.id, iv: existing.iv, data: existing.data },
+              });
+            }
+            return;
+          }
+        } else {
+          // Legacy client without version — use force update for backwards compat
+          stmts.insertOrUpdateEvent.run(event.id, roomId, event.iv, event.data);
+        }
+        stmts.updateRoomLastActive.run(roomId);
+        const updated = stmts.selectEvent.get(roomId, event.id);
+        const newVersion = updated ? updated.version : (existing.version + 1);
+        socket.to(roomId).emit("event:sync", { ...event, version: newVersion });
+        if (typeof callback === "function") callback({ success: true, version: newVersion });
+      }
     } catch (e) {
+      console.error("[event:save] Error:", e);
       if (typeof callback === "function") callback({ error: "Database error" });
     }
   });
@@ -795,8 +876,13 @@ nsp.on("connection", (socket) => {
     try {
       insertManyEvents(roomId, events);
       stmts.updateRoomLastActive.run(roomId);
-      socket.to(roomId).emit("event:bulk_sync", events);
-      if (typeof callback === "function") callback({ success: true });
+      // Fetch versions for all saved events
+      const savedEvents = events.map(event => {
+        const saved = stmts.selectEvent.get(roomId, event.id);
+        return { ...event, version: saved ? saved.version : 1 };
+      });
+      socket.to(roomId).emit("event:bulk_sync", savedEvents);
+      if (typeof callback === "function") callback({ success: true, versions: savedEvents.map(e => ({ id: e.id, version: e.version })) });
     } catch (e) {
       if (typeof callback === "function") callback({ error: "Bulk save failed" });
     }
@@ -853,7 +939,7 @@ nsp.on("connection", (socket) => {
 });
 
 const CLEANUP_INTERVAL = 60 * 66 * 1000;
-const EXPIRY_TIME = '-10 hours';
+const EXPIRY_TIME = '-48 hours';
 
 setInterval(() => {
   const now = new Date().toISOString();
